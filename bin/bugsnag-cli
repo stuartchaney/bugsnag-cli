@@ -1,0 +1,426 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "net/http"
+require "json"
+require "optparse"
+require "date"
+
+class BugsnagCLI
+  API_BASE = "https://api.bugsnag.com"
+
+  # Add your project aliases here for convenience
+  # Example: "web" => "5ff9e7bb1aecbb0012a6f8d9"
+  # Find project IDs with: bugsnag-cli projects list
+  PROJECTS = {}.freeze
+
+  def initialize
+    @token = ENV["BUGSNAG_API_TOKEN"]
+    abort "Error: BUGSNAG_API_TOKEN environment variable not set" unless @token
+  end
+
+  def run(args)
+    command = args.shift
+    subcommand = args.shift
+
+    case [command, subcommand]
+    when ["errors", "list"]
+      errors_list(args)
+    when ["errors", "link"]
+      errors_link(args)
+    when ["errors", "unlink"]
+      errors_unlink(args)
+    when ["errors", "create-issue"]
+      errors_create_issue(args)
+    when ["projects", "list"]
+      projects_list(args)
+    when ["errors", "watch"]
+      errors_watch(args)
+    else
+      puts usage
+      exit 1
+    end
+  end
+
+  private
+
+  def errors_list(args)
+    options = parse_errors_options(args)
+
+    unless options[:project]
+      abort "Error: --project is required\nUsage: bugsnag-cli errors list --project=PROJECT_ID [--id=ERROR_ID]\nTip: Run 'bugsnag-cli projects list' to find project IDs"
+    end
+
+    project_id = PROJECTS[options[:project]] || options[:project]
+
+    if options[:id]
+      fetch_error(project_id, options[:id])
+    else
+      fetch_errors(project_id)
+    end
+  end
+
+  def errors_link(args)
+    options = parse_link_options(args)
+    validate_link_options!(options)
+
+    project_id = PROJECTS[options[:project]] || options[:project]
+    result = patch_error(project_id, options[:id], {
+      operation: "link_issue",
+      issue_url: options[:url]
+    })
+
+    puts "Linked: #{options[:url]}"
+    puts "Error:  #{result["error_class"]} - #{result["message"]}"
+  end
+
+  def errors_unlink(args)
+    options = parse_link_options(args)
+    validate_link_options!(options)
+
+    project_id = PROJECTS[options[:project]] || options[:project]
+    result = patch_error(project_id, options[:id], {
+      operation: "unlink_issue",
+      issue_url: options[:url]
+    })
+
+    puts "Unlinked: #{options[:url]}"
+    puts "Error:    #{result["error_class"]} - #{result["message"]}"
+  end
+
+  def errors_create_issue(args)
+    options = parse_errors_options(args)
+
+    unless options[:project] && options[:id]
+      abort "Error: --project and --id are required\nUsage: bugsnag-cli errors create-issue --project=NAME --id=ERROR_ID"
+    end
+
+    project_id = PROJECTS[options[:project]] || options[:project]
+    result = patch_error(project_id, options[:id], { operation: "create_issue" })
+
+    if result["created_issue"] && result["created_issue"]["url"]
+      puts "Created: #{result["created_issue"]["url"]}"
+      puts "Error:   #{result["error_class"]} - #{result["message"]}"
+    else
+      puts "Issue created (no URL returned)"
+    end
+  end
+
+  def errors_watch(args)
+    options = parse_watch_options(args)
+
+    unless options[:project]
+      abort "Error: --project is required\nUsage: bugsnag-cli errors watch --project=NAME [--interval=60] [--min-events=10]"
+    end
+
+    project_id = PROJECTS[options[:project]] || options[:project]
+    interval = options[:interval] || 60
+    min_events = options[:min_events] || 10
+    seen_errors = {}
+
+    puts "Watching #{options[:project]} for new errors (min #{min_events} events, polling every #{interval}s)"
+    puts "Press Ctrl+C to stop"
+    puts "-" * 80
+
+    loop do
+      check_for_new_errors(project_id, min_events, seen_errors)
+      sleep interval
+    rescue Interrupt
+      puts "\nStopped watching"
+      break
+    rescue => e
+      puts "Error: #{e.message}"
+      sleep interval
+    end
+  end
+
+  def check_for_new_errors(project_id, min_events, seen_errors)
+    today = Date.today.to_s
+    errors = request("/projects/#{project_id}/errors?per_page=100&sort=events&direction=desc")
+
+    errors.each do |error|
+      next if seen_errors[error["id"]]
+      next if error["events"].to_i < min_events
+
+      first_seen_date = error["first_seen"]&.split("T")&.first
+      next unless first_seen_date == today
+
+      seen_errors[error["id"]] = true
+
+      # Print to console
+      puts
+      puts "[#{Time.now.strftime("%H:%M:%S")}] NEW ERROR (#{error["events"]} events)"
+      puts "  #{error["error_class"]}: #{truncate(error["message"], 70)}"
+      puts "  ID: #{error["id"]}"
+      puts "  Context: #{error["context"]}"
+
+      # macOS notification
+      notify(
+        "Bugsnag: #{error["error_class"]}",
+        "#{error["events"]} events - #{truncate(error["message"], 50)}"
+      )
+    end
+  end
+
+  def notify(title, message)
+    return unless RUBY_PLATFORM.include?("darwin")
+
+    system(
+      "osascript", "-e",
+      %Q{display notification "#{message.gsub('"', '\\"')}" with title "#{title.gsub('"', '\\"')}"}
+    )
+  end
+
+  def parse_watch_options(args)
+    options = {}
+    OptionParser.new do |opts|
+      opts.on("--project=PROJECT", "Project name (required)") { |v| options[:project] = v }
+      opts.on("--interval=SECONDS", Integer, "Poll interval in seconds (default: 60)") { |v| options[:interval] = v }
+      opts.on("--min-events=COUNT", Integer, "Minimum events threshold (default: 10)") { |v| options[:min_events] = v }
+    end.parse!(args)
+    options
+  end
+
+  def parse_link_options(args)
+    options = {}
+    OptionParser.new do |opts|
+      opts.on("--project=PROJECT", "Project name (required)") { |v| options[:project] = v }
+      opts.on("--id=ERROR_ID", "Error ID (required)") { |v| options[:id] = v }
+      opts.on("--url=ISSUE_URL", "Issue URL (required)") { |v| options[:url] = v }
+    end.parse!(args)
+    options
+  end
+
+  def validate_link_options!(options)
+    unless options[:project] && options[:id] && options[:url]
+      abort "Error: --project, --id, and --url are required\nUsage: bugsnag-cli errors link --project=NAME --id=ERROR_ID --url=ISSUE_URL"
+    end
+  end
+
+  def projects_list(args)
+    options = {}
+    OptionParser.new do |opts|
+      opts.on("--org=ORG_ID", "Organization ID") { |v| options[:org] = v }
+    end.parse!(args)
+
+    if options[:org]
+      response = request("/organizations/#{options[:org]}/projects")
+    else
+      orgs = request("/user/organizations")
+      response = []
+      orgs.each do |org|
+        projects = request("/organizations/#{org["id"]}/projects")
+        response.concat(projects.map { |p| p.merge("organization" => org["name"]) })
+      end
+    end
+
+    response.each do |project|
+      org_name = project["organization"] || ""
+      puts "#{project["id"]}\t#{org_name}\t#{project["name"]}"
+    end
+  end
+
+  def fetch_errors(project_id)
+    errors = request("/projects/#{project_id}/errors")
+
+    if errors.empty?
+      puts "No errors found"
+      return
+    end
+
+    # Header
+    puts format("%-26s %-9s %-8s %10s  %s", "ID", "SEVERITY", "STATUS", "EVENTS", "MESSAGE")
+    puts "-" * 100
+
+    errors.each do |error|
+      status = error["status"] || "open"
+      severity = error["severity"] || "error"
+      events = error["events"] || 0
+      message = truncate(error["message"] || error["error_class"], 50)
+
+      puts format("%-26s %-9s %-8s %10d  %s", error["id"], severity, status, events, message)
+    end
+
+    puts "-" * 100
+    puts "#{errors.size} errors"
+  end
+
+  def fetch_error(project_id, error_id)
+    error = request("/projects/#{project_id}/errors/#{error_id}")
+    events = request("/projects/#{project_id}/errors/#{error_id}/events?per_page=1&full_reports=true")
+
+    # Header
+    puts "=" * 100
+    puts "ERROR: #{error["error_class"]}"
+    puts "=" * 100
+    puts
+    puts "Message:       #{error["message"]}"
+    puts "Status:        #{error["status"]}"
+    puts "Severity:      #{error["severity"]}"
+    puts "Events:        #{error["events"]}"
+    puts "Users:         #{error["users_affected"]}"
+    puts "First seen:    #{error["first_seen"]}"
+    puts "Last seen:     #{error["last_seen"]}"
+    puts
+
+    # Show latest event with stacktrace
+    if events.is_a?(Array) && events.first
+      event = events.first
+      print_event_details(event)
+    end
+  end
+
+  def print_event_details(event)
+    puts "-" * 100
+    puts "LATEST EVENT"
+    puts "-" * 100
+    puts
+
+    # Context info
+    if event["context"]
+      puts "Context:       #{event["context"]}"
+    end
+
+    if event["request"]
+      req = event["request"]
+      puts "URL:           #{req["url"]}" if req["url"]
+      puts "Method:        #{req["httpMethod"]}" if req["httpMethod"]
+      puts "Client IP:     #{req["clientIp"]}" if req["clientIp"]
+    end
+
+    if event["user"]
+      user = event["user"]
+      user_info = [user["id"], user["email"], user["name"]].compact.join(" | ")
+      puts "User:          #{user_info}" unless user_info.empty?
+    end
+
+    if event["app"]
+      app = event["app"]
+      puts "Release:       #{app["releaseStage"]}" if app["releaseStage"]
+      puts "Version:       #{app["version"]}" if app["version"]
+    end
+
+    puts
+
+    # Exceptions with stacktraces
+    exceptions = event["exceptions"] || []
+    exceptions.each_with_index do |ex, idx|
+      puts "-" * 100
+      puts "EXCEPTION #{idx + 1}: #{ex["error_class"]}"
+      puts "Message: #{ex["message"]}"
+      puts "-" * 100
+      puts
+
+      stacktrace = ex["stacktrace"] || []
+      stacktrace.first(25).each_with_index do |frame, i|
+        file = frame["file"] || "?"
+        line = frame["line_number"] || "?"
+        method_name = frame["method"] || "?"
+        in_project = frame["in_project"] ? "*" : " "
+
+        puts format("%s %3d. %s:%s in `%s`", in_project, i + 1, file, line, method_name)
+      end
+
+      puts "... (#{stacktrace.size - 25} more frames)" if stacktrace.size > 25
+    end
+  end
+
+  def parse_errors_options(args)
+    options = {}
+    OptionParser.new do |opts|
+      opts.on("--project=PROJECT_ID", "Project ID (required)") { |v| options[:project] = v }
+      opts.on("--id=ERROR_ID", "Specific error ID") { |v| options[:id] = v }
+    end.parse!(args)
+    options
+  end
+
+  def request(path)
+    uri = URI("#{API_BASE}#{path}")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true
+
+    req = Net::HTTP::Get.new(uri)
+    req["Authorization"] = "token #{@token}"
+    req["X-Version"] = "2"
+
+    response = http.request(req)
+
+    case response.code.to_i
+    when 200
+      JSON.parse(response.body)
+    when 401
+      abort "Error: Unauthorized - check your BUGSNAG_API_TOKEN"
+    when 404
+      abort "Error: Not found - check your project/error ID"
+    else
+      abort "Error: API returned #{response.code} - #{response.body}"
+    end
+  end
+
+  def patch_error(project_id, error_id, body)
+    uri = URI("#{API_BASE}/projects/#{project_id}/errors/#{error_id}")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true
+
+    req = Net::HTTP::Patch.new(uri)
+    req["Authorization"] = "token #{@token}"
+    req["X-Version"] = "2"
+    req["Content-Type"] = "application/json"
+    req.body = JSON.generate(body)
+
+    response = http.request(req)
+
+    case response.code.to_i
+    when 200
+      JSON.parse(response.body)
+    when 401
+      abort "Error: Unauthorized - check your BUGSNAG_API_TOKEN"
+    else
+      error_msg = begin
+        JSON.parse(response.body)["errors"]&.join(", ") || response.body
+      rescue
+        response.body
+      end
+      abort "Error: #{error_msg}"
+    end
+  end
+
+  def truncate(str, length)
+    return "" unless str
+    str.length > length ? "#{str[0...length]}..." : str
+  end
+
+  def usage
+    <<~USAGE
+      Bugsnag CLI
+
+      Usage:
+        bugsnag-cli errors list --project=NAME [--id=ERROR_ID]
+        bugsnag-cli errors link --project=NAME --id=ERROR_ID --url=ISSUE_URL
+        bugsnag-cli errors unlink --project=NAME --id=ERROR_ID --url=ISSUE_URL
+        bugsnag-cli errors create-issue --project=NAME --id=ERROR_ID
+        bugsnag-cli errors watch --project=NAME [--interval=60] [--min-events=10]
+        bugsnag-cli projects list [--org=ORG_ID]
+
+      Environment:
+        BUGSNAG_API_TOKEN  Your Bugsnag personal auth token (required)
+
+      Commands:
+        errors list          List errors for a project
+        errors link          Link a Linear/Jira issue to an error
+        errors unlink        Unlink an issue from an error
+        errors create-issue  Create issue via configured integration
+        errors watch         Watch for new errors (desktop notifications)
+        projects list        List all projects
+
+      Examples:
+        bugsnag-cli projects list
+        bugsnag-cli errors list --project=5ff9e7bb1aecbb001234abcd
+        bugsnag-cli errors list --project=5ff9e7bb1aecbb001234abcd --id=64a2b3c4d5e6f789
+        bugsnag-cli errors link --project=PROJECT_ID --id=ERROR_ID --url=https://linear.app/team/issue/BUG-123
+        bugsnag-cli errors watch --project=PROJECT_ID --min-events=50 --interval=30
+    USAGE
+  end
+end
+
+BugsnagCLI.new.run(ARGV)
